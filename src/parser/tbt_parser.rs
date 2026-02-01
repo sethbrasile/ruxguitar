@@ -10,6 +10,9 @@ use crate::parser::song_parser::{
     DEFAULT_PERCUSSION_BANK, QUARTER_TIME,
 };
 use crate::parser::tbt_types::*;
+
+// Re-export TbtSong for external consumers
+pub use crate::parser::tbt_types::TbtSong;
 use crate::RuxError;
 use crc32fast::Hasher;
 use flate2::read::ZlibDecoder;

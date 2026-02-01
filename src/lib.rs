@@ -33,3 +33,4 @@ pub use parser::song_parser::{
     parse_gp_data, Beat, BeatEffects, Duration, Measure, MeasureHeader, MidiChannel, Note,
     NoteEffect, Song, Tempo, TimeSignature, Track, QUARTER_TIME,
 };
+pub use parser::tbt_parser::{is_tbt_file, parse_tbt_data, tbt_to_song, TbtSong};
