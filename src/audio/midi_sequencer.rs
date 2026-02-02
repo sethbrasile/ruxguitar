@@ -130,7 +130,7 @@ mod tests {
     use super::*;
     use crate::audio::midi_builder::MidiBuilder;
     use crate::parser::song_parser_tests::parse_gp_file;
-    use std::rc::Rc;
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
@@ -152,7 +152,7 @@ mod tests {
     fn test_sequence_demo_song() {
         const FILE_PATH: &str = "test-files/Demo v5.gp5";
         let song = parse_gp_file(FILE_PATH).unwrap();
-        let song = Rc::new(song);
+        let song = Arc::new(song);
         let builder = MidiBuilder::new();
         let events = builder.build_for_song(&song);
         let events_len = 4471;

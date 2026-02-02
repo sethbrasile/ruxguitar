@@ -20,7 +20,6 @@ use ruxguitar::audio::midi_player::AudioPlayer;
 use ruxguitar::parser::song_parser::{parse_gp_data, GpVersion, Song};
 use ruxguitar::parser::tbt_parser::{is_tbt_file, parse_tbt_data, tbt_to_song};
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::watch::{Receiver, Sender};
 use tokio::sync::Mutex;
@@ -251,19 +250,19 @@ impl RuxApplication {
                             let default_track_selection = track_selections[default_track].clone();
                             self.track_selection = default_track_selection;
                             // share song ownership with tablature and player
-                            let song_rc = Rc::new(song);
+                            let song_arc = Arc::new(song);
                             let tablature_scroll_id =
                                 Id::new(Cow::Borrowed("tablature-scroll-elements"));
                             let tablature = Tablature::new(
-                                song_rc.clone(),
+                                song_arc.clone(),
                                 default_track,
                                 tablature_scroll_id.clone(),
                             );
                             self.tablature = Some(tablature);
                             // audio player initialization
                             let audio_player = AudioPlayer::new(
-                                song_rc.clone(),
-                                song_rc.tempo.value,
+                                song_arc.clone(),
+                                song_arc.tempo.value,
                                 self.tempo_selection.percentage,
                                 self.sound_font_file.clone(),
                                 self.beat_sender.clone(),

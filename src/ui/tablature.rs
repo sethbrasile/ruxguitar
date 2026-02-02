@@ -6,12 +6,12 @@ use iced::{Element, Length};
 use iced_aw::Wrap;
 use ruxguitar::parser::song_parser::Song;
 use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 const INNER_PADDING: f32 = 10.0;
 
 pub struct Tablature {
-    pub song: Rc<Song>,
+    pub song: Arc<Song>,
     pub track_id: usize,
     pub canvas_measures: Vec<CanvasMeasure>,
     canvas_measure_height: f32,
@@ -22,7 +22,7 @@ pub struct Tablature {
 }
 
 impl Tablature {
-    pub fn new(song: Rc<Song>, track_id: usize, scroll_id: Id) -> Self {
+    pub fn new(song: Arc<Song>, track_id: usize, scroll_id: Id) -> Self {
         let measure_count = song.measure_headers.len();
         let mut measure_per_tick = BTreeMap::new();
         for (i, measure) in song.measure_headers.iter().enumerate() {

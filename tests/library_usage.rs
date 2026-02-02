@@ -7,7 +7,7 @@ use ruxguitar::{
     parse_gp_data, MidiBuilder, MidiEventType, RuxError, Song, FIRST_TICK, QUARTER_TIME,
 };
 use std::io::Read;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Test that all major types are accessible from the library.
 #[test]
@@ -52,8 +52,8 @@ fn test_midi_generation() {
         .expect("Failed to read test file");
 
     let song = parse_gp_data(&file_data).expect("Failed to parse GP5 file");
-    let song_rc = Rc::new(song);
-    let midi_events = MidiBuilder::new().build_for_song(&song_rc);
+    let song_arc = Arc::new(song);
+    let midi_events = MidiBuilder::new().build_for_song(&song_arc);
 
     // Verify MIDI events were generated
     assert!(!midi_events.is_empty(), "Should generate MIDI events");

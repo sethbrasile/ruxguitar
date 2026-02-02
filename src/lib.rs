@@ -9,12 +9,12 @@
 //!
 //! ```no_run
 //! use ruxguitar::{parse_gp_data, MidiBuilder};
-//! use std::rc::Rc;
+//! use std::sync::Arc;
 //!
 //! let file_data = std::fs::read("song.gp5").unwrap();
 //! let song = parse_gp_data(&file_data).unwrap();
-//! let song_rc = Rc::new(song);
-//! let midi_events = MidiBuilder::new().build_for_song(&song_rc);
+//! let song_arc = Arc::new(song);
+//! let midi_events = MidiBuilder::new().build_for_song(&song_arc);
 //! ```
 
 pub mod audio;
@@ -25,6 +25,8 @@ pub mod parser;
 pub use audio::{
     midi_builder::MidiBuilder,
     midi_event::{MidiEvent, MidiEventType},
+    midi_player::AudioPlayer,
+    midi_player_params::MidiPlayerParams,
     midi_sequencer::MidiSequencer,
     FIRST_TICK,
 };

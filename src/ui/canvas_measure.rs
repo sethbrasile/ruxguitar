@@ -11,7 +11,7 @@ use ruxguitar::parser::song_parser::{
     Beat, HarmonicType, Note, NoteEffect, NoteType, SlapEffect, SlideType, Song, TimeSignature,
 };
 use std::ops::Div;
-use std::rc::Rc;
+use std::sync::Arc;
 
 // Drawing constants
 
@@ -45,7 +45,7 @@ const MIN_MEASURE_WIDTH: f32 = 60.0;
 pub struct CanvasMeasure {
     pub measure_id: usize,
     track_id: usize,
-    song: Rc<Song>,
+    song: Arc<Song>,
     is_focused: bool,
     focused_beat: usize,
     canvas_cache: Cache,
@@ -59,7 +59,7 @@ impl CanvasMeasure {
     pub fn new(
         measure_id: usize,
         track_id: usize,
-        song: Rc<Song>,
+        song: Arc<Song>,
         focused: bool,
         has_time_signature: bool,
     ) -> Self {

@@ -9,7 +9,6 @@ use cpal::DefaultStreamConfigError;
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 use std::fs::File;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch::Sender;
 
@@ -20,8 +19,8 @@ const TIMIDITY_SOUND_FONT: &[u8] = include_bytes!("../../resources/TimGM6mb.sf2"
 
 pub struct AudioPlayer {
     is_playing: bool,
-    song: Rc<Song>,                              // Song to play (shared with app)
-    stream: Option<Rc<cpal::Stream>>,            // Stream is not Send & Sync
+    song: Arc<Song>,                              // Song to play (shared with app)
+    stream: Option<Arc<cpal::Stream>>,            // Stream wrapped in Arc for thread safety
     sequencer: Arc<Mutex<MidiSequencer>>,        // Need a handle to reset sequencer
     player_params: Arc<Mutex<MidiPlayerParams>>, // Use to communicate play changes to sequencer
     synthesizer: Arc<Mutex<Synthesizer>>,        // Synthesizer for audio output
@@ -31,7 +30,7 @@ pub struct AudioPlayer {
 
 impl AudioPlayer {
     pub fn new(
-        song: Rc<Song>,
+        song: Arc<Song>,
         song_tempo: u32,
         tempo_percentage: u32,
         sound_font_file: Option<PathBuf>,
@@ -159,7 +158,7 @@ impl AudioPlayer {
 
             match stream {
                 Ok(stream) => {
-                    self.stream = Some(Rc::new(stream));
+                    self.stream = Some(Arc::new(stream));
                 }
                 Err(err) => {
                     log::error!("Failed to create audio stream: {err}");
@@ -189,6 +188,58 @@ impl AudioPlayer {
         // set tempo for focuses measure
         let mut player_params_guard = self.player_params.lock().unwrap();
         player_params_guard.set_tempo(tempo);
+    }
+
+    /// Seek to a specific tick position.
+    ///
+    /// Pauses if playing, seeks to the tick, then resumes if was playing.
+    pub fn seek_to_tick(&mut self, tick: u32) {
+        let was_playing = self.is_playing;
+
+        // Pause stream if playing
+        if was_playing {
+            if let Some(stream) = &self.stream {
+                stream.pause().unwrap();
+            }
+        }
+
+        // Move sequencer to the requested tick
+        let mut sequencer_guard = self.sequencer.lock().unwrap();
+        sequencer_guard.set_tick(tick);
+        sequencer_guard.reset_last_time();
+        drop(sequencer_guard);
+
+        // Stop all currently playing notes
+        let mut synthesizer_guard = self.synthesizer.lock().unwrap();
+        synthesizer_guard.note_off_all(false);
+        drop(synthesizer_guard);
+
+        // Resume stream if was playing
+        if was_playing {
+            if let Some(stream) = &self.stream {
+                stream.play().unwrap();
+            }
+        }
+    }
+
+    /// Get the current playback tick position.
+    pub fn get_current_tick(&self) -> u32 {
+        self.sequencer.lock().unwrap().get_tick()
+    }
+
+    /// Set mute state for a specific track.
+    pub fn set_track_muted(&self, track_id: usize, muted: bool) {
+        self.player_params.lock().unwrap().set_track_muted(track_id, muted);
+    }
+
+    /// Check if a track is muted.
+    pub fn is_track_muted(&self, track_id: usize) -> bool {
+        self.player_params.lock().unwrap().is_track_muted(track_id)
+    }
+
+    /// Check if a track is audible (considering both solo and mute state).
+    pub fn is_track_audible(&self, track_id: usize) -> bool {
+        self.player_params.lock().unwrap().is_track_audible(track_id)
     }
 }
 
@@ -287,7 +338,6 @@ fn new_output_stream(
                         events.len()
                     );
                 }
-                let solo_track_id = player_params_guard.solo_track_id();
                 if events
                     .iter()
                     .any(super::midi_event::MidiEvent::is_note_event)
@@ -299,9 +349,9 @@ fn new_output_stream(
                 for midi_event in events {
                     match midi_event.event {
                         MidiEventType::NoteOn(channel, key, velocity) => {
-                            if let Some(track_id) = solo_track_id {
-                                // skip note on events for other tracks in solo mode
-                                if midi_event.track != Some(track_id as u8) {
+                            // Check if track is audible (handles both solo and mute)
+                            if let Some(track_id) = midi_event.track {
+                                if !player_params_guard.is_track_audible(track_id as usize) {
                                     continue;
                                 }
                             }

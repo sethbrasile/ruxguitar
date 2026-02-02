@@ -6,7 +6,7 @@ use crate::parser::song_parser::{
     Song, Track, TremoloBarEffect, TripletFeel, MIN_VELOCITY, QUARTER_TIME, SEMITONE_LENGTH,
     VELOCITY_INCREMENT,
 };
-use std::rc::Rc;
+use std::sync::Arc;
 
 const DEFAULT_DURATION_DEAD: u32 = 30;
 const DEFAULT_DURATION_PM: u32 = 60;
@@ -38,7 +38,7 @@ impl MidiBuilder {
     }
 
     /// Parse song and record events
-    pub fn build_for_song(mut self, song: &Rc<Song>) -> Vec<MidiEvent> {
+    pub fn build_for_song(mut self, song: &Arc<Song>) -> Vec<MidiEvent> {
         for (track_id, track) in song.tracks.iter().enumerate() {
             log::debug!("building events for track {track_id}");
             let midi_channel = song
@@ -836,7 +836,7 @@ mod tests {
             eprintln!("Parsing file: {file_name}");
             let song = parse_tab_file(file_path)
                 .unwrap_or_else(|err| panic!("Failed to parse file: {file_name}\n{err}"));
-            let song = Rc::new(song);
+            let song = Arc::new(song);
             let builder = MidiBuilder::new();
             let events = builder.build_for_song(&song);
             assert!(!events.is_empty(), "No events found for {file_name}");
@@ -884,7 +884,7 @@ mod tests {
     fn test_midi_events_for_demo_song() {
         const FILE_PATH: &str = "test-files/Demo v5.gp5";
         let song = parse_gp_file(FILE_PATH).unwrap();
-        let song = Rc::new(song);
+        let song = Arc::new(song);
         let builder = MidiBuilder::new();
         let events = builder.build_for_song(&song);
 
@@ -1143,7 +1143,7 @@ mod tests {
     fn test_midi_events_for_bleed() {
         const FILE_PATH: &str = "test-files/Meshuggah - Bleed.gp5";
         let song = parse_gp_file(FILE_PATH).unwrap();
-        let song = Rc::new(song);
+        let song = Arc::new(song);
         let builder = MidiBuilder::new();
         let events = builder.build_for_song(&song);
 
@@ -1238,7 +1238,7 @@ mod tests {
     fn test_midi_events_for_tbt_aguado_study() {
         const FILE_PATH: &str = "test-files/Aguado - Study 1.tbt";
         let song = parse_tab_file(FILE_PATH).unwrap();
-        let song = Rc::new(song);
+        let song = Arc::new(song);
         let builder = MidiBuilder::new();
         let events = builder.build_for_song(&song);
 
