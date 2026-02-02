@@ -19,8 +19,8 @@ const TIMIDITY_SOUND_FONT: &[u8] = include_bytes!("../../resources/TimGM6mb.sf2"
 
 pub struct AudioPlayer {
     is_playing: bool,
-    song: Arc<Song>,                              // Song to play (shared with app)
-    stream: Option<Arc<cpal::Stream>>,            // Stream wrapped in Arc for thread safety
+    song: Arc<Song>,                             // Song to play (shared with app)
+    stream: Option<cpal::Stream>,                // Audio output stream (not Send/Sync)
     sequencer: Arc<Mutex<MidiSequencer>>,        // Need a handle to reset sequencer
     player_params: Arc<Mutex<MidiPlayerParams>>, // Use to communicate play changes to sequencer
     synthesizer: Arc<Mutex<Synthesizer>>,        // Synthesizer for audio output
@@ -113,7 +113,9 @@ impl AudioPlayer {
         // Pause stream
         if let Some(stream) = &self.stream {
             log::info!("Stopping audio stream");
-            stream.pause().unwrap();
+            if let Err(e) = stream.pause() {
+                log::error!("Failed to pause stream during stop: {e}");
+            }
         }
         self.is_playing = false;
 
@@ -137,12 +139,16 @@ impl AudioPlayer {
         if let Some(ref stream) = self.stream {
             if self.is_playing {
                 self.is_playing = false;
-                stream.pause().unwrap();
+                if let Err(e) = stream.pause() {
+                    log::error!("Failed to pause stream: {e}");
+                }
             } else {
                 self.is_playing = true;
                 // reset last time to not advance time too fast on resume
                 self.sequencer.lock().unwrap().reset_last_time();
-                stream.play().unwrap();
+                if let Err(e) = stream.play() {
+                    log::error!("Failed to play stream: {e}");
+                }
             }
         } else {
             self.is_playing = true;
@@ -158,7 +164,7 @@ impl AudioPlayer {
 
             match stream {
                 Ok(stream) => {
-                    self.stream = Some(Arc::new(stream));
+                    self.stream = Some(stream);
                 }
                 Err(err) => {
                     log::error!("Failed to create audio stream: {err}");
@@ -199,7 +205,9 @@ impl AudioPlayer {
         // Pause stream if playing
         if was_playing {
             if let Some(stream) = &self.stream {
-                stream.pause().unwrap();
+                if let Err(e) = stream.pause() {
+                    log::error!("Failed to pause stream during seek: {e}");
+                }
             }
         }
 
@@ -217,7 +225,9 @@ impl AudioPlayer {
         // Resume stream if was playing
         if was_playing {
             if let Some(stream) = &self.stream {
-                stream.play().unwrap();
+                if let Err(e) = stream.play() {
+                    log::error!("Failed to resume stream after seek: {e}");
+                }
             }
         }
     }
@@ -229,7 +239,10 @@ impl AudioPlayer {
 
     /// Set mute state for a specific track.
     pub fn set_track_muted(&self, track_id: usize, muted: bool) {
-        self.player_params.lock().unwrap().set_track_muted(track_id, muted);
+        self.player_params
+            .lock()
+            .unwrap()
+            .set_track_muted(track_id, muted);
     }
 
     /// Check if a track is muted.
@@ -239,7 +252,10 @@ impl AudioPlayer {
 
     /// Check if a track is audible (considering both solo and mute state).
     pub fn is_track_audible(&self, track_id: usize) -> bool {
-        self.player_params.lock().unwrap().is_track_audible(track_id)
+        self.player_params
+            .lock()
+            .unwrap()
+            .is_track_audible(track_id)
     }
 }
 
@@ -249,6 +265,10 @@ enum AudioStreamError {
     CpalDeviceNotFount,
     #[error("no output configuration found: {0}")]
     CpalOutputConfigNotFound(DefaultStreamConfigError),
+    #[error("failed to build output stream: {0}")]
+    StreamBuildError(String),
+    #[error("failed to start stream playback: {0}")]
+    StreamPlayError(String),
 }
 
 /// Create a new output stream for audio playback.
@@ -423,7 +443,9 @@ fn new_output_stream(
         err_fn,
         None, // blocking stream
     );
-    let stream = stream.unwrap();
-    stream.play().unwrap();
+    let stream = stream.map_err(|e| AudioStreamError::StreamBuildError(e.to_string()))?;
+    stream
+        .play()
+        .map_err(|e| AudioStreamError::StreamPlayError(e.to_string()))?;
     Ok(stream)
 }

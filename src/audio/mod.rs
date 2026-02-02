@@ -1,3 +1,4 @@
+pub mod audio_engine;
 pub mod midi_builder;
 pub mod midi_event;
 pub mod midi_player;

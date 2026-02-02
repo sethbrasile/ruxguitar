@@ -2,10 +2,11 @@
 //!
 //! This library provides:
 //! - Parsing of Guitar Pro 4/5 (.gp4, .gp5) files
+//! - Parsing of TabIt (.tbt) files
 //! - MIDI event generation from parsed songs
-//! - MIDI sequencing utilities
+//! - Thread-safe audio engine for playback integration
 //!
-//! # Example
+//! # Example - Parsing and MIDI Generation
 //!
 //! ```no_run
 //! use ruxguitar::{parse_gp_data, MidiBuilder};
@@ -16,6 +17,22 @@
 //! let song_arc = Arc::new(song);
 //! let midi_events = MidiBuilder::new().build_for_song(&song_arc);
 //! ```
+//!
+//! # Example - Thread-Safe Audio Engine (for Tauri, etc.)
+//!
+//! ```no_run
+//! use ruxguitar::{parse_gp_data, AudioEngine};
+//! use std::sync::Arc;
+//!
+//! let file_data = std::fs::read("song.gp5").unwrap();
+//! let song = parse_gp_data(&file_data).unwrap();
+//! let engine = AudioEngine::new(Arc::new(song), 120, 100, None).unwrap();
+//!
+//! engine.play().unwrap();
+//! // ... later
+//! engine.pause().unwrap();
+//! engine.stop().unwrap();
+//! ```
 
 pub mod audio;
 pub mod error;
@@ -23,6 +40,7 @@ pub mod parser;
 
 // Re-export main types for convenience
 pub use audio::{
+    audio_engine::{AudioEngine, AudioState},
     midi_builder::MidiBuilder,
     midi_event::{MidiEvent, MidiEventType},
     midi_player::AudioPlayer,
