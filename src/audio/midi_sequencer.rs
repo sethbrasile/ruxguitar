@@ -68,6 +68,21 @@ impl MidiSequencer {
         Some(&self.sorted_events[start..end])
     }
 
+    /// Called after draining due events. Include the fractional tick carried
+    /// by advance_frames so callback boundaries never round an event early.
+    pub(super) fn frames_until_next_event(&self, tempo: u32, sample_rate: u32) -> usize {
+        let Some(event) = self.sorted_events.get(self.next_event) else {
+            return usize::MAX;
+        };
+        if tempo == 0 {
+            return usize::MAX;
+        }
+        let ticks = u128::from(event.tick - self.current_tick);
+        let remaining = ticks * u128::from(sample_rate) * 60 - u128::from(self.tick_fraction);
+        let per_frame = u128::from(tempo) * u128::from(QUARTER_TICKS);
+        usize::try_from(remaining.div_ceil(per_frame)).unwrap_or(usize::MAX)
+    }
+
     /// Advance by audio actually rendered, so an idle or delayed callback
     /// cannot rush a cluster of notes to catch up with wall-clock time.
     pub fn advance_frames(&mut self, tempo: u32, frames: usize, sample_rate: u32) {
