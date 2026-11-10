@@ -184,14 +184,14 @@ pub enum TbtBarType {
     OpenCloseRepeat,
 }
 
-/// Bar line information
-#[derive(Debug, Clone, PartialEq)]
+/// Shared boundary in ordinary sixteenth-space coordinates. Annotations are
+/// independent: a close from one bar and an open for the next can coincide.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TbtBarLine {
-    /// Space position of the bar line
-    pub space: u16,
-    /// Type of bar line
-    pub bar_type: TbtBarType,
-    /// Repeat count (for close repeats)
+    pub space: u32,
+    pub double: bool,
+    pub open_repeat: bool,
+    pub close_repeat: bool,
     pub repeat_count: u8,
 }
 
@@ -287,31 +287,48 @@ pub struct TbtAlternateTime {
 /// Track effect change types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TbtEffectChangeType {
-    Stroke = 1,
-    Tempo = 2,
-    Instrument = 3,
-    Volume = 4,
-    Pan = 5,
-    Chorus = 6,
-    Reverb = 7,
-    Modulation = 8,
-    PitchBend = 9,
+    StrokeDown,
+    StrokeUp,
+    Tempo,
+    Instrument,
+    Volume,
+    Pan,
+    Chorus,
+    Reverb,
+    Modulation,
+    PitchBend,
+    Unknown(u16),
 }
 
 impl TbtEffectChangeType {
-    /// Parse effect type from byte
-    pub const fn from_byte(byte: u8) -> Option<TbtEffectChangeType> {
-        match byte {
-            1 => Some(TbtEffectChangeType::Stroke),
-            2 => Some(TbtEffectChangeType::Tempo),
-            3 => Some(TbtEffectChangeType::Instrument),
-            4 => Some(TbtEffectChangeType::Volume),
-            5 => Some(TbtEffectChangeType::Pan),
-            6 => Some(TbtEffectChangeType::Chorus),
-            7 => Some(TbtEffectChangeType::Reverb),
-            8 => Some(TbtEffectChangeType::Modulation),
-            9 => Some(TbtEffectChangeType::PitchBend),
-            _ => None,
+    /// Decode a later numeric ID or an older inline ASCII ID.
+    pub const fn from_raw(raw: u16, inline: bool) -> Self {
+        if inline {
+            match raw {
+                0x44 => Self::StrokeDown,
+                0x55 => Self::StrokeUp,
+                0x54 | 0x74 => Self::Tempo,
+                0x49 => Self::Instrument,
+                0x56 => Self::Volume,
+                0x50 => Self::Pan,
+                0x43 => Self::Chorus,
+                0x52 => Self::Reverb,
+                _ => Self::Unknown(raw),
+            }
+        } else {
+            match raw {
+                1 => Self::StrokeDown,
+                2 => Self::StrokeUp,
+                3 => Self::Tempo,
+                4 => Self::Instrument,
+                5 => Self::Volume,
+                6 => Self::Pan,
+                7 => Self::Chorus,
+                8 => Self::Reverb,
+                9 => Self::Modulation,
+                10 => Self::PitchBend,
+                _ => Self::Unknown(raw),
+            }
         }
     }
 }
@@ -319,12 +336,14 @@ impl TbtEffectChangeType {
 /// Track effect change event
 #[derive(Debug, Clone, PartialEq)]
 pub struct TbtEffectChange {
-    /// Space position
+    /// Track-local cell position.
     pub space: u32,
+    pub raw_id: u16,
     /// Effect type
     pub effect_type: TbtEffectChangeType,
     /// Effect value (interpretation depends on effect_type)
     pub value: u16,
+    pub source_order: u32,
 }
 
 /// Fully parsed TBT song before conversion to GP format

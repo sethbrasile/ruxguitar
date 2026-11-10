@@ -635,7 +635,7 @@ fn decode_delta_list_chunks(
 
 /// Parse bar lines for version 0x70+ (ArrayList format)
 fn parse_bar_lines_0x70(input: &[u8], bar_count: u16) -> IResult<&[u8], Vec<TbtBarLine>> {
-    let mut bars = Vec::with_capacity(bar_count as usize);
+    let mut bars = std::collections::BTreeMap::<u32, TbtBarLine>::new();
     let mut input = input;
     let mut current_space: u32 = 0;
 
@@ -646,27 +646,37 @@ fn parse_bar_lines_0x70(input: &[u8], bar_count: u16) -> IResult<&[u8], Vec<TbtB
         let (rest, repeat_count) = le_u8(rest)?;
         input = rest;
 
-        current_space += space_inc;
+        if space_inc == 0 {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Verify,
+            )));
+        }
+        let next_space = current_space.checked_add(space_inc).ok_or_else(|| {
+            nom::Err::Failure(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::TooLarge,
+            ))
+        })?;
 
-        // Decode bar type from the type byte
-        // Bits 0-3 indicate the bar type
-        let bar_type = match bar_byte & 0x0F {
-            0x01 => TbtBarType::Single,
-            0x02 => TbtBarType::CloseRepeat,
-            0x03 => TbtBarType::OpenRepeat,
-            0x04 => TbtBarType::Double,
-            0x05 => TbtBarType::OpenCloseRepeat,
-            _ => TbtBarType::Single,
-        };
-
-        bars.push(TbtBarLine {
-            space: current_space as u16,
-            bar_type,
-            repeat_count,
+        let start = bars.entry(current_space).or_insert_with(|| TbtBarLine {
+            space: current_space,
+            ..Default::default()
         });
+        start.double |= bar_byte & 0x01 != 0;
+        start.open_repeat |= bar_byte & 0x02 != 0;
+        let end = bars.entry(next_space).or_insert_with(|| TbtBarLine {
+            space: next_space,
+            ..Default::default()
+        });
+        end.close_repeat |= bar_byte & 0x04 != 0;
+        if bar_byte & 0x04 != 0 {
+            end.repeat_count = repeat_count;
+        }
+        current_space = next_space;
     }
 
-    Ok((input, bars))
+    Ok((input, bars.into_values().collect()))
 }
 
 /// Parse bar lines for version 0x6f (DeltaListChunk format)
@@ -674,7 +684,7 @@ fn parse_bar_lines_0x6f(input: &[u8], space_count: u16) -> IResult<&[u8], Vec<Tb
     // For 0x6f, bar lines are stored as a delta list with 1 slot per space
     let (remaining, expanded) = decode_delta_list_chunks(input, 1, u32::from(space_count))?;
 
-    let mut bars = Vec::new();
+    let mut bars = std::collections::BTreeMap::<u32, TbtBarLine>::new();
 
     for (space_idx, slots) in expanded.iter().enumerate() {
         let bar_byte = slots[0];
@@ -682,38 +692,68 @@ fn parse_bar_lines_0x6f(input: &[u8], space_count: u16) -> IResult<&[u8], Vec<Tb
             continue; // No bar at this position
         }
 
-        // Bits 0-3: bar type, bits 4-7: repeat count
+        // 0x6f encodes the marker after the current cell, except open repeat
+        // which starts before it. The terminal ordinary marker is at the last
+        // cell and therefore describes the boundary at space_count.
         let bar_type_bits = bar_byte & 0x0F;
         let repeat_count = (bar_byte >> 4) & 0x0F;
-
-        let bar_type = match bar_type_bits {
-            0x01 => TbtBarType::Single,
-            0x02 => TbtBarType::CloseRepeat,
-            0x03 => TbtBarType::OpenRepeat,
-            0x04 => TbtBarType::Double,
-            0x05 => TbtBarType::OpenCloseRepeat,
-            _ => continue,
-        };
-
-        bars.push(TbtBarLine {
-            space: space_idx as u16,
-            bar_type,
-            repeat_count,
-        });
+        if !matches!(bar_type_bits, 1..=5) {
+            continue;
+        }
+        let before = space_idx as u32;
+        let after = before + 1;
+        if matches!(bar_type_bits, 3 | 5) {
+            bars.entry(before)
+                .or_insert_with(|| TbtBarLine {
+                    space: before,
+                    ..Default::default()
+                })
+                .open_repeat = true;
+        }
+        if bar_type_bits != 3 {
+            let end = bars.entry(after).or_insert_with(|| TbtBarLine {
+                space: after,
+                ..Default::default()
+            });
+            end.double |= bar_type_bits == 4;
+            end.close_repeat |= matches!(bar_type_bits, 2 | 5);
+            if end.close_repeat {
+                end.repeat_count = repeat_count;
+            }
+        }
     }
 
-    Ok((remaining, bars))
+    bars.entry(u32::from(space_count))
+        .or_insert_with(|| TbtBarLine {
+            space: u32::from(space_count),
+            ..Default::default()
+        });
+    Ok((remaining, bars.into_values().collect()))
 }
 
 /// Parse notes for a single track
-fn parse_track_notes(input: &[u8], space_count: u32) -> IResult<&[u8], Vec<TbtNote>> {
+fn parse_track_notes(
+    input: &[u8],
+    space_count: u32,
+) -> IResult<&[u8], (Vec<TbtNote>, Vec<TbtEffectChange>)> {
     // Notes use NOTES_SLOT_COUNT slots per space (20 slots)
     // TBT format can have MULTIPLE delta list chunks per track
     let (remaining, expanded) = decode_delta_list_chunks(input, NOTES_SLOT_COUNT, space_count)?;
 
     let mut notes = Vec::new();
+    let mut controls = Vec::new();
 
     for (space_idx, slots) in expanded.iter().enumerate() {
+        if slots[16] != 0 {
+            let raw_id = u16::from(slots[16]);
+            controls.push(TbtEffectChange {
+                space: space_idx as u32,
+                raw_id,
+                effect_type: TbtEffectChangeType::from_raw(raw_id, true),
+                value: u16::from(slots[19]) + if raw_id == u16::from(b't') { 250 } else { 0 },
+                source_order: controls.len() as u32,
+            });
+        }
         // Slots 0-7: Note values for strings 0-7
         // 0x80 + fret = note, 0x11 = mute, 0x12 = stop
         for string in 0..STRINGS_PER_TRACK {
@@ -747,7 +787,7 @@ fn parse_track_notes(input: &[u8], space_count: u32) -> IResult<&[u8], Vec<TbtNo
         }
     }
 
-    Ok((remaining, notes))
+    Ok((remaining, (notes, controls)))
 }
 
 /// Parse alternate time regions for a single track
@@ -781,6 +821,12 @@ fn parse_track_effect_changes(input: &[u8]) -> IResult<&[u8], Vec<TbtEffectChang
     // Chunk4 format: first u32 is BYTE LENGTH (not entry count)
     let (input, byte_length) = le_u32(input)?;
 
+    if byte_length % 8 != 0 {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::LengthValue,
+        )));
+    }
     // Each entry is 8 bytes, so divide by 8 to get entry count
     let entry_count = byte_length as usize / 8;
     let mut changes = Vec::with_capacity(entry_count);
@@ -795,15 +841,21 @@ fn parse_track_effect_changes(input: &[u8]) -> IResult<&[u8], Vec<TbtEffectChang
         let (rest, value) = le_u16(rest)?;
         input = rest;
 
-        current_space += u32::from(space_inc);
-
-        if let Some(effect_type) = TbtEffectChangeType::from_byte(effect_num as u8) {
-            changes.push(TbtEffectChange {
-                space: current_space,
-                effect_type,
-                value,
-            });
-        }
+        current_space = current_space
+            .checked_add(u32::from(space_inc))
+            .ok_or_else(|| {
+                nom::Err::Failure(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::TooLarge,
+                ))
+            })?;
+        changes.push(TbtEffectChange {
+            space: current_space,
+            raw_id: effect_num,
+            effect_type: TbtEffectChangeType::from_raw(effect_num, false),
+            value,
+            source_order: changes.len() as u32,
+        });
     }
 
     Ok((input, changes))
@@ -868,13 +920,16 @@ pub fn parse_tbt_body(
 
     // 2. Parse notes for each track
     let mut track_notes = Vec::with_capacity(header.track_count as usize);
+    let mut track_effect_changes = Vec::with_capacity(header.track_count as usize);
     for i in 0..header.track_count {
         let track_space_count = get_track_space_count(header, metadata, i);
-        let (rest, notes) = parse_track_notes(input, track_space_count).map_err(|e| {
-            RuxError::ParsingError(format!("Failed to parse notes for track {i}: {e}"))
-        })?;
+        let (rest, (notes, inline_controls)) = parse_track_notes(input, track_space_count)
+            .map_err(|e| {
+                RuxError::ParsingError(format!("Failed to parse notes for track {i}: {e}"))
+            })?;
         input = rest;
         track_notes.push(notes);
+        track_effect_changes.push(inline_controls);
     }
 
     // 3. Parse alternate time regions (if feature bit is set)
@@ -896,19 +951,18 @@ pub fn parse_tbt_body(
     }
 
     // 4. Parse track effect changes (version >= 0x71)
-    let mut track_effect_changes = Vec::with_capacity(header.track_count as usize);
     if header.version.has_track_effect_changes_chunk() {
         for i in 0..header.track_count {
             let (rest, changes) = parse_track_effect_changes(input).map_err(|e| {
                 RuxError::ParsingError(format!("Failed to parse effect changes for track {i}: {e}"))
             })?;
             input = rest;
-            track_effect_changes.push(changes);
-        }
-    } else {
-        // No track effect changes - create empty vectors
-        for _ in 0..header.track_count {
-            track_effect_changes.push(Vec::new());
+            let controls = &mut track_effect_changes[i as usize];
+            let offset = controls.len() as u32;
+            controls.extend(changes.into_iter().map(|mut change| {
+                change.source_order += offset;
+                change
+            }));
         }
     }
 
@@ -1081,7 +1135,7 @@ fn convert_tuning(tbt_track: &TbtTrack) -> Vec<(i32, i32)> {
 
 /// Infer time signature from space count between bars
 /// Default to 4/4 (16 spaces per measure)
-fn infer_time_signature(spaces_in_measure: u16) -> TimeSignature {
+fn infer_time_signature(spaces_in_measure: u32) -> TimeSignature {
     // Common time signatures:
     // 4/4 = 16 spaces (4 quarter notes * 4 sixteenths)
     // 3/4 = 12 spaces
@@ -1102,7 +1156,7 @@ fn infer_time_signature(spaces_in_measure: u16) -> TimeSignature {
             // Try to figure out based on divisibility (any multiple of 4 works)
             // Note: Using manual check instead of is_multiple_of() for Rust 1.75 compatibility
             #[allow(clippy::manual_is_multiple_of)]
-            if spaces_in_measure % 4 == 0 {
+            if spaces_in_measure % 4 == 0 && spaces_in_measure / 4 <= u32::from(u8::MAX) {
                 ((spaces_in_measure / 4) as u8, 4)
             } else {
                 (4, 4) // Default
@@ -1242,8 +1296,8 @@ pub fn tbt_to_song(tbt: &TbtSong) -> Result<Song, RuxError> {
     }
 
     // 2. Calculate measure boundaries from bar lines
-    let mut measure_spaces: Vec<(u16, u16)> = Vec::new(); // (start_space, end_space)
-    let mut prev_space: u16 = 0;
+    let mut measure_spaces: Vec<(u32, u32)> = Vec::new(); // (start_space, end_space)
+    let mut prev_space: u32 = 0;
 
     for bar in &tbt.bar_lines {
         if bar.space > prev_space {
@@ -1253,13 +1307,18 @@ pub fn tbt_to_song(tbt: &TbtSong) -> Result<Song, RuxError> {
     }
 
     // Add final measure if there are notes after the last bar
-    if prev_space < tbt.header.space_count {
-        measure_spaces.push((prev_space, tbt.header.space_count));
+    let song_end = tbt
+        .bar_lines
+        .last()
+        .map(|bar| bar.space)
+        .unwrap_or(u32::from(tbt.header.space_count));
+    if prev_space < song_end {
+        measure_spaces.push((prev_space, song_end));
     }
 
     // If no bar lines, create one big measure
     if measure_spaces.is_empty() {
-        measure_spaces.push((0, tbt.header.space_count));
+        measure_spaces.push((0, song_end));
     }
 
     // 3. Create measure headers
@@ -1279,21 +1338,11 @@ pub fn tbt_to_song(tbt: &TbtSong) -> Result<Song, RuxError> {
         let bar_at_start = tbt.bar_lines.iter().find(|b| b.space == *start_space);
         let bar_at_end = tbt.bar_lines.iter().find(|b| b.space == *end_space);
 
-        let repeat_open = bar_at_start
-            .map(|b| {
-                matches!(
-                    b.bar_type,
-                    TbtBarType::OpenRepeat | TbtBarType::OpenCloseRepeat
-                )
-            })
-            .unwrap_or(i == 0); // First measure implicitly opens
+        let repeat_open = bar_at_start.map(|b| b.open_repeat).unwrap_or(i == 0); // First measure implicitly opens
 
         let repeat_close = bar_at_end
             .map(|b| {
-                if matches!(
-                    b.bar_type,
-                    TbtBarType::CloseRepeat | TbtBarType::OpenCloseRepeat
-                ) {
+                if b.close_repeat {
                     b.repeat_count.max(1) as i8
                 } else {
                     0
@@ -1339,9 +1388,8 @@ pub fn tbt_to_song(tbt: &TbtSong) -> Result<Song, RuxError> {
             let header = &measure_headers[measure_idx];
 
             // Collect notes in this measure
-            let notes_in_measure: Vec<(&u32, &Vec<&TbtNote>)> = notes_by_space
-                .range(u32::from(*start_space)..u32::from(*end_space))
-                .collect();
+            let notes_in_measure: Vec<(&u32, &Vec<&TbtNote>)> =
+                notes_by_space.range(*start_space..*end_space).collect();
 
             // Create beats from notes
             let mut beats: Vec<Beat> = Vec::new();
@@ -1362,14 +1410,14 @@ pub fn tbt_to_song(tbt: &TbtSong) -> Result<Song, RuxError> {
 
                 for (note_idx, (space, notes)) in notes_in_measure.iter().enumerate() {
                     // Calculate beat start tick
-                    let relative_space = **space - u32::from(*start_space);
+                    let relative_space = **space - *start_space;
                     let beat_start = header.start + (relative_space * TICKS_PER_SPACE);
 
                     // Calculate duration to next note or measure end
                     let next_space = if note_idx + 1 < space_positions.len() {
                         space_positions[note_idx + 1]
                     } else {
-                        u32::from(*end_space)
+                        *end_space
                     };
 
                     let duration = calculate_duration(**space, next_space, &header.time_signature);
@@ -1818,7 +1866,7 @@ mod tests {
         for (i, bar) in song.bar_lines.iter().take(5).enumerate() {
             println!(
                 "  Bar {}: space={}, type={:?}, repeat={}",
-                i, bar.space, bar.bar_type, bar.repeat_count
+                i, bar.space, bar.open_repeat, bar.repeat_count
             );
         }
 
@@ -1847,14 +1895,14 @@ mod tests {
         // Version 0x6f doesn't have alternate time features typically
         assert_eq!(song.alternate_times.len(), 8);
 
-        // Version 0x6f doesn't have track effect changes
+        // Version 0x6f has no separate effect chunk, but inline controls
+        // still live in note slots 16 and 19.
         assert_eq!(song.track_effect_changes.len(), 8);
-        for changes in &song.track_effect_changes {
-            assert!(
-                changes.is_empty(),
-                "Version 0x6f should not have track effect changes"
-            );
-        }
+        assert!(song
+            .track_effect_changes
+            .iter()
+            .flatten()
+            .all(|change| change.raw_id != 0));
     }
 
     #[test]
@@ -1993,12 +2041,74 @@ mod tests {
 
     #[test]
     fn test_bar_type_parsing() {
-        // Verify bar type byte decoding
-        assert_eq!(TbtBarType::Single as u8, 0); // Just checking the enum exists
+        let newer = [2, 0, 0, 0, 0x06, 3, 2, 0, 0, 0, 0, 0];
+        let (_, boundaries) = parse_bar_lines_0x70(&newer, 2).unwrap();
+        assert_eq!(
+            boundaries.iter().map(|b| b.space).collect::<Vec<_>>(),
+            [0, 2, 4]
+        );
+        assert!(boundaries[0].open_repeat);
+        assert!(boundaries[1].close_repeat);
+        assert_eq!(boundaries[1].repeat_count, 3);
+        assert!(!boundaries[2].close_repeat);
 
-        // The bar type extraction in parse_bar_lines_0x6f uses:
-        // bar_type_bits = bar_byte & 0x0F
-        // 0x01 = Single, 0x02 = CloseRepeat, 0x03 = OpenRepeat, 0x04 = Double, 0x05 = OpenCloseRepeat
+        let mut older = vec![0, 0];
+        // 15 empty cells, close after index 15 with repeat count 3,
+        // then open before index 16, followed by 15 empty cells.
+        older.extend_from_slice(&[15, 0, 1, 0x32, 1, 3, 15, 0]);
+        older[0..2].copy_from_slice(&4u16.to_le_bytes());
+        let (_, boundaries) = parse_bar_lines_0x6f(&older, 32).unwrap();
+        assert_eq!(
+            boundaries.iter().map(|b| b.space).collect::<Vec<_>>(),
+            [16, 32]
+        );
+        assert!(boundaries[0].open_repeat && boundaries[0].close_repeat);
+        assert_eq!(boundaries[0].repeat_count, 3);
+
+        let overflow = [
+            u32::MAX.to_le_bytes().as_slice(),
+            &[0, 0],
+            &[2, 0, 0, 0, 0, 0],
+        ]
+        .concat();
+        assert!(parse_bar_lines_0x70(&overflow, 2).is_err());
+        let zero = [0, 0, 0, 0, 0, 0];
+        assert!(parse_bar_lines_0x70(&zero, 1).is_err());
+    }
+
+    #[test]
+    fn test_raw_track_effect_codes_and_errors() {
+        let mut slots = vec![0u8; 20];
+        slots[16] = b'D';
+        slots[19] = 7;
+        let mut raw = vec![1, 0, 20, 0];
+        // Fill 20 slots using one pair per distinct run.
+        raw.clear();
+        raw.extend_from_slice(&3u16.to_le_bytes());
+        raw.extend_from_slice(&[16, 0, 1, b'D', 3, 7]);
+        let (_, (notes, effects)) = parse_track_notes(&raw, 1).unwrap();
+        assert!(notes.is_empty());
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].effect_type, TbtEffectChangeType::StrokeDown);
+        assert_eq!(effects[0].value, 7);
+
+        let mut later = Vec::new();
+        later.extend_from_slice(&16u32.to_le_bytes());
+        later.extend_from_slice(&[4, 0, 3, 0, 0, 0, 150, 0]);
+        later.extend_from_slice(&[0, 0, 4, 0, 0, 0, 162, 0]);
+        let (_, effects) = parse_track_effect_changes(&later).unwrap();
+        assert_eq!(
+            effects
+                .iter()
+                .map(|e| (e.space, e.raw_id, e.value))
+                .collect::<Vec<_>>(),
+            [(4, 3, 150), (4, 4, 162)]
+        );
+        assert_eq!(effects[0].effect_type, TbtEffectChangeType::Tempo);
+        assert_eq!(effects[1].effect_type, TbtEffectChangeType::Instrument);
+        later[0] = 15;
+        assert!(parse_track_effect_changes(&later).is_err());
+        assert!(parse_track_effect_changes(&later[..10]).is_err());
     }
 
     #[test]

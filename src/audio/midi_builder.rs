@@ -1245,7 +1245,7 @@ mod tests {
         // Basic structure assertions
         assert_eq!(events.len(), 376);
         assert_eq!(events[0].tick, 1);
-        assert_eq!(events.iter().last().unwrap().tick, 50880);
+        assert_eq!(events.iter().last().unwrap().tick, 48960);
 
         // Assert single track (classical guitar piece)
         let track_count = song.tracks.len();
@@ -1280,9 +1280,9 @@ mod tests {
         assert_eq!(event.track, Some(0));
         assert!(matches!(event.event, MidiEventType::NoteOn(0, 64, 95)));
 
-        // Last note off: A2 (MIDI 45) at tick 50880
+        // Last note off: A2 (MIDI 45) at the corrected source boundary.
         let last_event = events.iter().last().unwrap();
-        assert_eq!(last_event.tick, 50880);
+        assert_eq!(last_event.tick, 48960);
         assert!(matches!(last_event.event, MidiEventType::NoteOff(0, 45)));
     }
 }
