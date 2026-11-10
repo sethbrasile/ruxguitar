@@ -186,7 +186,7 @@ pub enum TbtBarType {
 
 /// Shared boundary in ordinary sixteenth-space coordinates. Annotations are
 /// independent: a close from one bar and an open for the next can coincide.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TbtBarLine {
     pub space: u32,
     pub double: bool,
@@ -285,7 +285,7 @@ pub struct TbtAlternateTime {
 }
 
 /// Track effect change types
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TbtEffectChangeType {
     StrokeDown,
     StrokeUp,
@@ -334,7 +334,7 @@ impl TbtEffectChangeType {
 }
 
 /// Track effect change event
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TbtEffectChange {
     /// Track-local cell position.
     pub space: u32,

@@ -54,3 +54,4 @@ pub use parser::song_parser::{
     NoteEffect, Song, Tempo, TimeSignature, Track, QUARTER_TIME,
 };
 pub use parser::tbt_parser::{is_tbt_file, parse_tbt_data, tbt_to_song, TbtSong};
+pub use parser::tbt_timeline::{ExactTick, TbtRatioRun, TbtStop, TbtTimeline, TbtTrackTimeline};

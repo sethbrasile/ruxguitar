@@ -9,6 +9,7 @@ use crate::parser::song_parser::{
     SongInfo, Tempo, TimeSignature, Track, TremoloPickingEffect, TripletFeel, Voice, DEFAULT_BANK,
     DEFAULT_PERCUSSION_BANK, QUARTER_TIME,
 };
+use crate::parser::tbt_timeline::TbtTimeline;
 use crate::parser::tbt_types::*;
 
 // Re-export TbtSong for external consumers
@@ -1173,18 +1174,24 @@ fn infer_time_signature(spaces_in_measure: u32) -> TimeSignature {
     }
 }
 
-/// Group notes by their space position for creating beats
-fn group_notes_by_space(notes: &[TbtNote]) -> std::collections::BTreeMap<u32, Vec<&TbtNote>> {
-    let mut groups: std::collections::BTreeMap<u32, Vec<&TbtNote>> =
-        std::collections::BTreeMap::new();
-
+/// Group attacks by rounded absolute engine tick for the GP projection.
+fn group_notes_by_tick<'a>(
+    notes: &'a [TbtNote],
+    timeline: &TbtTimeline,
+    track_idx: usize,
+) -> Result<std::collections::BTreeMap<u32, Vec<&'a TbtNote>>, RuxError> {
+    let mut groups = std::collections::BTreeMap::new();
     for note in notes {
-        // Convert vsq position to space position
-        let space = note.vsq_position / (SLOTS_PER_SPACE as u32);
-        groups.entry(space).or_default().push(note);
+        if note.is_stop {
+            continue;
+        }
+        let relative = timeline.time_at(track_idx, note.vsq_position / SLOTS_PER_SPACE as u32)?;
+        let tick = QUARTER_TIME
+            .checked_add(relative.rounded_tick()?)
+            .ok_or_else(|| RuxError::ParsingError("TBT note tick overflows u32".into()))?;
+        groups.entry(tick).or_insert_with(Vec::new).push(note);
     }
-
-    groups
+    Ok(groups)
 }
 
 /// Calculate note duration based on gap to next note or end of measure
@@ -1237,6 +1244,7 @@ fn calculate_duration(
 /// Convert a TbtSong to a GP Song
 #[allow(clippy::unnecessary_wraps)] // Result is needed for consistent API with parse_gp_data
 pub fn tbt_to_song(tbt: &TbtSong) -> Result<Song, RuxError> {
+    let timeline = TbtTimeline::from_parsed(tbt)?;
     // 1. Create MIDI channels (one per track)
     let mut midi_channels: Vec<MidiChannel> = Vec::with_capacity(64);
 
@@ -1362,7 +1370,7 @@ pub fn tbt_to_song(tbt: &TbtSong) -> Result<Song, RuxError> {
             key_signature: KeySignature::new(0, false),
         };
 
-        current_tick += header.length();
+        current_tick = QUARTER_TIME + end_space * TICKS_PER_SPACE;
         measure_headers.push(header);
     }
 
@@ -1373,13 +1381,14 @@ pub fn tbt_to_song(tbt: &TbtSong) -> Result<Song, RuxError> {
         let strings = convert_tuning(tbt_track);
         let string_count = strings.len();
 
-        // Group this track's notes by space
+        // Group this track's attacks by exact source time, rounded only at
+        // the legacy GP tick consumer.
         let track_notes = tbt
             .track_notes
             .get(track_idx)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let notes_by_space = group_notes_by_space(track_notes);
+        let notes_by_tick = group_notes_by_tick(track_notes, &timeline, track_idx)?;
 
         // Create measures for this track
         let mut measures: Vec<Measure> = Vec::with_capacity(measure_spaces.len());
@@ -1388,8 +1397,11 @@ pub fn tbt_to_song(tbt: &TbtSong) -> Result<Song, RuxError> {
             let header = &measure_headers[measure_idx];
 
             // Collect notes in this measure
-            let notes_in_measure: Vec<(&u32, &Vec<&TbtNote>)> =
-                notes_by_space.range(*start_space..*end_space).collect();
+            let measure_start_tick = QUARTER_TIME + start_space * TICKS_PER_SPACE;
+            let measure_end_tick = QUARTER_TIME + end_space * TICKS_PER_SPACE;
+            let notes_in_measure: Vec<(&u32, &Vec<&TbtNote>)> = notes_by_tick
+                .range(measure_start_tick..measure_end_tick)
+                .collect();
 
             // Create beats from notes
             let mut beats: Vec<Beat> = Vec::new();
@@ -1406,21 +1418,21 @@ pub fn tbt_to_song(tbt: &TbtSong) -> Result<Song, RuxError> {
                 });
             } else {
                 // Create beats from note groups
-                let space_positions: Vec<u32> = notes_in_measure.iter().map(|(s, _)| **s).collect();
+                let note_positions: Vec<u32> = notes_in_measure.iter().map(|(s, _)| **s).collect();
 
-                for (note_idx, (space, notes)) in notes_in_measure.iter().enumerate() {
-                    // Calculate beat start tick
-                    let relative_space = **space - *start_space;
-                    let beat_start = header.start + (relative_space * TICKS_PER_SPACE);
+                for (note_idx, (tick, notes)) in notes_in_measure.iter().enumerate() {
+                    let beat_start = **tick;
 
                     // Calculate duration to next note or measure end
-                    let next_space = if note_idx + 1 < space_positions.len() {
-                        space_positions[note_idx + 1]
+                    let next_tick = if note_idx + 1 < note_positions.len() {
+                        note_positions[note_idx + 1]
                     } else {
-                        *end_space
+                        measure_end_tick
                     };
 
-                    let duration = calculate_duration(**space, next_space, &header.time_signature);
+                    let rounded_spaces =
+                        ((next_tick - beat_start + TICKS_PER_SPACE / 2) / TICKS_PER_SPACE).max(1);
+                    let duration = calculate_duration(0, rounded_spaces, &header.time_signature);
 
                     // Create GP notes from TBT notes
                     let mut gp_notes: Vec<Note> = Vec::new();
