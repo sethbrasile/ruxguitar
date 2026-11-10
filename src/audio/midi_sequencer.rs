@@ -103,9 +103,13 @@ mod tests {
     fn frame_clock_keeps_triplet_spacing_after_idle() {
         let mut sequencer = MidiSequencer::new(Vec::new());
         sequencer.set_tick(960);
+        sequencer.advance_frames(120, 256, 48_000);
         std::thread::sleep(Duration::from_millis(100));
-        // At 120 BPM and 48 kHz, 4,000 stereo frames are exactly 160 ticks.
-        for expected in [1120, 1280, 1440, 1600] {
+        // A delayed callback still completes only the first 4,000 frames:
+        // at 120 BPM and 48 kHz, those are exactly 160 ticks.
+        sequencer.advance_frames(120, 3_744, 48_000);
+        assert_eq!(sequencer.get_tick(), 1120);
+        for expected in [1280, 1440, 1600] {
             sequencer.advance_frames(120, 4_000, 48_000);
             assert_eq!(sequencer.get_tick(), expected);
         }
