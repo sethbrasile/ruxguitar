@@ -1,12 +1,10 @@
 use crate::audio::midi_event::MidiEvent;
-use std::time::Instant;
-
-const QUARTER_TIME: f32 = 960.0; // 1 quarter note = 960 ticks
+const QUARTER_TICKS: u64 = 960;
 
 pub struct MidiSequencer {
     current_tick: u32,             // current Midi tick
     last_tick: u32,                // last Midi tick
-    last_time: Instant,            // last time in milliseconds
+    tick_fraction: u64,            // fractional tick numerator at the output sample rate
     sorted_events: Vec<MidiEvent>, // sorted Midi events
     next_event: usize,             // first event not yet delivered
 }
@@ -21,7 +19,7 @@ impl MidiSequencer {
         Self {
             current_tick: 0,
             last_tick: 0,
-            last_time: Instant::now(),
+            tick_fraction: 0,
             sorted_events,
             next_event: 0,
         }
@@ -36,19 +34,17 @@ impl MidiSequencer {
     pub fn set_tick(&mut self, tick: u32) {
         self.last_tick = tick;
         self.current_tick = tick;
+        self.tick_fraction = 0;
         self.next_event = self
             .sorted_events
             .partition_point(|event| event.tick < tick);
-    }
-
-    pub fn reset_last_time(&mut self) {
-        self.last_time = Instant::now();
     }
 
     #[allow(clippy::missing_const_for_fn)]
     pub fn reset_ticks(&mut self) {
         self.current_tick = 0;
         self.last_tick = 0;
+        self.tick_fraction = 0;
         self.next_event = 0;
     }
 
@@ -72,21 +68,19 @@ impl MidiSequencer {
         Some(&self.sorted_events[start..end])
     }
 
-    pub fn advance(&mut self, tempo: u32) {
-        // init sequencer if first advance after reset
-        if self.current_tick == self.last_tick {
-            self.current_tick += 1;
-            self.last_time = Instant::now();
-            return;
-        }
-        // check how many ticks have passed since last advance
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_time);
-        let elapsed_secs = elapsed.as_secs_f32();
-        let tick_increase = tick_increase(tempo, elapsed_secs);
-        self.last_time = now;
+    /// Advance by audio actually rendered, so an idle or delayed callback
+    /// cannot rush a cluster of notes to catch up with wall-clock time.
+    pub fn advance_frames(&mut self, tempo: u32, frames: usize, sample_rate: u32) {
+        assert!(sample_rate > 0);
+        let denominator = u64::from(sample_rate) * 60;
+        let numerator = frames as u128 * u128::from(tempo) * u128::from(QUARTER_TICKS)
+            + u128::from(self.tick_fraction);
+        let delta = numerator / u128::from(denominator);
         self.last_tick = self.current_tick;
-        self.current_tick += tick_increase;
+        self.current_tick = self
+            .current_tick
+            .saturating_add(delta.min(u128::from(u32::MAX)) as u32);
+        self.tick_fraction = (numerator % u128::from(denominator)) as u64;
     }
 
     #[cfg(test)]
@@ -95,12 +89,6 @@ impl MidiSequencer {
         self.last_tick = self.current_tick;
         self.current_tick += tick;
     }
-}
-
-fn tick_increase(tempo_bpm: u32, elapsed_seconds: f32) -> u32 {
-    let tempo_bps = tempo_bpm as f32 / 60.0;
-    let bump = QUARTER_TIME * tempo_bps * elapsed_seconds;
-    bump as u32
 }
 
 #[cfg(test)]
@@ -112,19 +100,28 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn test_tick_increase() {
-        let tempo = 100;
-        let elapsed = Duration::from_millis(32);
-        let result = tick_increase(tempo, elapsed.as_secs_f32());
-        assert_eq!(result, 51);
+    fn frame_clock_keeps_triplet_spacing_after_idle() {
+        let mut sequencer = MidiSequencer::new(Vec::new());
+        sequencer.set_tick(960);
+        std::thread::sleep(Duration::from_millis(100));
+        // At 120 BPM and 48 kHz, 4,000 stereo frames are exactly 160 ticks.
+        for expected in [1120, 1280, 1440, 1600] {
+            sequencer.advance_frames(120, 4_000, 48_000);
+            assert_eq!(sequencer.get_tick(), expected);
+        }
     }
 
     #[test]
-    fn test_tick_increase_bis() {
-        let tempo = 120;
-        let elapsed = Duration::from_millis(100);
-        let result = tick_increase(tempo, elapsed.as_secs_f32());
-        assert_eq!(result, 192);
+    fn frame_clock_carries_subtick_fractions_between_callbacks() {
+        let mut sequencer = MidiSequencer::new(Vec::new());
+        for _ in 0..46 {
+            sequencer.advance_frames(120, 256, 48_000);
+        }
+        sequencer.advance_frames(120, 224, 48_000);
+        assert_eq!(sequencer.get_tick(), 480);
+        sequencer.set_tick(960);
+        sequencer.advance_frames(120, 4_000, 48_000);
+        assert_eq!(sequencer.get_tick(), 1120);
     }
 
     #[test]

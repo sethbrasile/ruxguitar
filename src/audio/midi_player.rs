@@ -174,7 +174,6 @@ impl AudioPlayer {
 
         // reset ticks
         let mut sequencer_guard = self.sequencer.lock().unwrap();
-        sequencer_guard.reset_last_time();
         sequencer_guard.reset_ticks();
         drop(sequencer_guard);
 
@@ -199,8 +198,6 @@ impl AudioPlayer {
                 }
             } else {
                 self.is_playing = true;
-                // reset last time to not advance time too fast on resume
-                self.sequencer.lock().unwrap().reset_last_time();
                 if let Err(e) = stream.play() {
                     log::error!("Failed to play stream: {e}");
                 }
@@ -272,7 +269,6 @@ impl AudioPlayer {
         // Move sequencer to the requested tick
         let mut sequencer_guard = self.sequencer.lock().unwrap();
         sequencer_guard.set_tick(tick);
-        sequencer_guard.reset_last_time();
         drop(sequencer_guard);
 
         // Stop all currently playing notes
@@ -407,6 +403,7 @@ fn new_output_stream(
     let mut track_left: Vec<f32> = vec![0_f32; channel_sample_count as usize];
     let mut track_right: Vec<f32> = vec![0_f32; channel_sample_count as usize];
 
+    let channel_count = usize::from(stream_config.channels);
     let err_fn = |err| log::error!("an error occurred on stream: {err}");
 
     let stream = device.build_output_stream(
@@ -414,7 +411,11 @@ fn new_output_stream(
         move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
             let mut player_params_guard = player_params.lock().unwrap();
             let mut sequencer_guard = sequencer.lock().unwrap();
-            sequencer_guard.advance(player_params_guard.adjusted_tempo());
+            sequencer_guard.advance_frames(
+                player_params_guard.adjusted_tempo(),
+                output.len() / channel_count,
+                sample_rate,
+            );
             let mut synthesizer_guard = synthesizers.lock().unwrap();
             let tick = sequencer_guard.get_tick();
             let last_tick = sequencer_guard.get_last_tick();
