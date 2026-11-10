@@ -39,6 +39,7 @@ pub mod error;
 pub mod parser;
 
 // Re-export main types for convenience
+pub use audio::tbt_playback::{TbtAttack, TbtPlayback, TbtPlaybackTrack};
 pub use audio::{
     audio_engine::{AudioEngine, AudioState},
     midi_builder::MidiBuilder,

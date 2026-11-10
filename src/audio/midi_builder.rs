@@ -37,6 +37,13 @@ impl MidiBuilder {
         Self { events: Vec::new() }
     }
 
+    pub fn build_for_tbt(
+        self,
+        playback: &crate::audio::tbt_playback::TbtPlayback,
+    ) -> Result<Vec<MidiEvent>, crate::RuxError> {
+        crate::audio::tbt_playback::build_tbt_events(playback)
+    }
+
     /// Parse song and record events
     pub fn build_for_song(mut self, song: &Arc<Song>) -> Vec<MidiEvent> {
         for (track_id, track) in song.tracks.iter().enumerate() {
@@ -834,6 +841,17 @@ mod tests {
             let file_name = path.file_name().unwrap().to_str().unwrap();
             let file_path = path.to_str().unwrap();
             eprintln!("Parsing file: {file_name}");
+            if extension == "tbt" {
+                // Historical gold files were generated from the GP projection's
+                // fixed-cell clock. TBT playback now uses the source ruler.
+                let source = crate::parse_tbt_data(&std::fs::read(file_path).unwrap()).unwrap();
+                let playback = crate::TbtPlayback::from_parsed(&source).unwrap();
+                let events = MidiBuilder::new().build_for_tbt(&playback).unwrap();
+                assert!(!events.is_empty(), "No TBT events found for {file_name}");
+                assert!(events.windows(2).all(|w| w[0].tick <= w[1].tick));
+                assert_eq!(events[0].tick, 1);
+                continue;
+            }
             let song = parse_tab_file(file_path)
                 .unwrap_or_else(|err| panic!("Failed to parse file: {file_name}\n{err}"));
             let song = Arc::new(song);

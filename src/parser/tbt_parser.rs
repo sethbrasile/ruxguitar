@@ -593,6 +593,8 @@ fn expand_delta_list(pairs: &[u8], slots_per_space: usize, total_spaces: usize) 
 
 /// Maximum number of chunks to read to prevent DoS from malformed files
 const MAX_DELTA_LIST_CHUNKS: usize = 10_000;
+const MAX_TRACK_CELLS: u32 = 1_000_000;
+const MAX_DELTA_PAIR_BYTES: usize = 40_000_000;
 
 /// Decode delta-list chunks from the input stream until we have enough data.
 ///
@@ -605,7 +607,20 @@ fn decode_delta_list_chunks(
     slots_per_space: usize,
     total_spaces: u32,
 ) -> IResult<&[u8], Vec<Vec<u8>>> {
-    let target_count = slots_per_space * total_spaces as usize;
+    if total_spaces == 0 || total_spaces > MAX_TRACK_CELLS {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        )));
+    }
+    let target_count = slots_per_space
+        .checked_mul(total_spaces as usize)
+        .ok_or_else(|| {
+            nom::Err::Failure(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::TooLarge,
+            ))
+        })?;
     let mut accumulated_pairs: Vec<u8> = Vec::new();
     let mut input = input;
     let mut chunk_count = 0;
@@ -620,6 +635,12 @@ fn decode_delta_list_chunks(
         }
 
         let (rest, chunk_pairs) = read_delta_list_chunk_raw(input)?;
+        if accumulated_pairs.len() + chunk_pairs.len() > MAX_DELTA_PAIR_BYTES {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::TooLarge,
+            )));
+        }
         accumulated_pairs.extend_from_slice(&chunk_pairs);
         input = rest;
         chunk_count += 1;
@@ -750,6 +771,7 @@ fn parse_track_notes(
             controls.push(TbtEffectChange {
                 space: space_idx as u32,
                 raw_id,
+                inline: true,
                 effect_type: TbtEffectChangeType::from_raw(raw_id, true),
                 value: u16::from(slots[19]) + if raw_id == u16::from(b't') { 250 } else { 0 },
                 source_order: controls.len() as u32,
@@ -784,6 +806,7 @@ fn parse_track_notes(
                 is_muted,
                 is_stop,
                 effect,
+                raw_effect: effect_byte,
             });
         }
     }
@@ -828,6 +851,12 @@ fn parse_track_effect_changes(input: &[u8]) -> IResult<&[u8], Vec<TbtEffectChang
             nom::error::ErrorKind::LengthValue,
         )));
     }
+    if byte_length as usize > input.len() || byte_length > 8_000_000 {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Eof,
+        )));
+    }
     // Each entry is 8 bytes, so divide by 8 to get entry count
     let entry_count = byte_length as usize / 8;
     let mut changes = Vec::with_capacity(entry_count);
@@ -853,6 +882,7 @@ fn parse_track_effect_changes(input: &[u8]) -> IResult<&[u8], Vec<TbtEffectChang
         changes.push(TbtEffectChange {
             space: current_space,
             raw_id: effect_num,
+            inline: false,
             effect_type: TbtEffectChangeType::from_raw(effect_num, false),
             value,
             source_order: changes.len() as u32,
@@ -1105,7 +1135,7 @@ fn convert_effect(tbt_effect: Option<TbtStringEffect>) -> NoteEffect {
 /// Standard guitar tuning (MIDI note values, low to high): E2(40), A2(45), D3(50), G3(55), B3(59), E4(64)
 /// TBT stores tuning as SIGNED OFFSETS from standard 6-string guitar tuning.
 /// For example, a bass tuned to E1(28) stores offset -12 (28 = 40 - 12).
-const STANDARD_GUITAR_TUNING: [i32; 8] = [40, 45, 50, 55, 59, 64, 69, 74]; // Extended for 7/8 string
+const STANDARD_GUITAR_TUNING: [i32; 6] = [40, 45, 50, 55, 59, 64];
 
 /// TBT stores tuning as signed byte offsets from standard guitar tuning.
 /// Zero offset means standard tuning for that string.
@@ -1121,11 +1151,14 @@ fn convert_tuning(tbt_track: &TbtTrack) -> Vec<(i32, i32)> {
         let string_num = (string_count - i) as i32; // GP numbering (1 = highest)
 
         // Get base tuning from standard guitar tuning
-        let base_tuning = STANDARD_GUITAR_TUNING.get(i).copied().unwrap_or(40);
-
-        // TBT tuning is a signed offset from standard tuning
-        let tuning_offset = tbt_track.tuning[i] as i8; // Interpret as signed!
-        let midi_note = base_tuning + i32::from(tuning_offset);
+        // The six guitar strings use signed deviations from standard; the
+        // seventh/eighth bytes in the extended-string corpus carry an
+        // absolute MIDI pitch (for example 64 or 49), not another deviation.
+        let midi_note = if let Some(base) = STANDARD_GUITAR_TUNING.get(i) {
+            base + i32::from(tbt_track.tuning[i] as i8)
+        } else {
+            i32::from(tbt_track.tuning[i])
+        };
         strings.push((string_num, midi_note));
     }
 

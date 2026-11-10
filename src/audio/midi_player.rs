@@ -1,4 +1,5 @@
 use crate::audio::midi_builder::MidiBuilder;
+use crate::audio::midi_event::MidiEvent;
 use crate::audio::midi_event::MidiEventType;
 use crate::audio::midi_player_params::MidiPlayerParams;
 use crate::audio::midi_sequencer::MidiSequencer;
@@ -23,9 +24,10 @@ pub struct AudioPlayer {
     stream: Option<cpal::Stream>,                // Audio output stream (not Send/Sync)
     sequencer: Arc<Mutex<MidiSequencer>>,        // Need a handle to reset sequencer
     player_params: Arc<Mutex<MidiPlayerParams>>, // Use to communicate play changes to sequencer
-    synthesizer: Arc<Mutex<Synthesizer>>,        // Synthesizer for audio output
-    sound_font: Arc<SoundFont>,                  // Sound font for synthesizer
-    beat_sender: Arc<Sender<u32>>,               // Notify beat changes
+    synthesizers: Arc<Mutex<Vec<Synthesizer>>>,  // One synth per track for TBT
+    track_isolated: bool,
+    sound_font: Arc<SoundFont>,    // Sound font for synthesizer
+    beat_sender: Arc<Sender<u32>>, // Notify beat changes
 }
 
 impl AudioPlayer {
@@ -36,6 +38,53 @@ impl AudioPlayer {
         sound_font_file: Option<PathBuf>,
         beat_sender: Arc<Sender<u32>>,
     ) -> Self {
+        let events = MidiBuilder::new().build_for_song(&song);
+        Self::new_with_events(
+            song,
+            song_tempo,
+            tempo_percentage,
+            sound_font_file,
+            beat_sender,
+            events,
+            1,
+            false,
+        )
+    }
+
+    /// Initialize the native player with the exact trace from `build_for_tbt`.
+    pub fn new_with_tbt_events(
+        song: Arc<Song>,
+        song_tempo: u32,
+        tempo_percentage: u32,
+        sound_font_file: Option<PathBuf>,
+        beat_sender: Arc<Sender<u32>>,
+        events: Vec<MidiEvent>,
+        track_count: usize,
+    ) -> Self {
+        assert!(track_count > 0);
+        Self::new_with_events(
+            song,
+            song_tempo,
+            tempo_percentage,
+            sound_font_file,
+            beat_sender,
+            events,
+            track_count,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_events(
+        song: Arc<Song>,
+        song_tempo: u32,
+        tempo_percentage: u32,
+        sound_font_file: Option<PathBuf>,
+        beat_sender: Arc<Sender<u32>>,
+        events: Vec<MidiEvent>,
+        synth_count: usize,
+        track_isolated: bool,
+    ) -> Self {
         // default to no solo track
         let solo_track_id = None;
 
@@ -45,10 +94,6 @@ impl AudioPlayer {
             tempo_percentage,
             solo_track_id,
         )));
-
-        // midi sequencer initialization
-        let builder = MidiBuilder::new();
-        let events = builder.build_for_song(&song);
 
         // sound font setup
         let sound_font = if let Some(sound_font_file) = sound_font_file {
@@ -61,10 +106,12 @@ impl AudioPlayer {
         let sound_font = Arc::new(sound_font);
 
         // build new default synthesizer for the stream
-        let synthesizer = Self::make_synthesizer(sound_font.clone(), DEFAULT_SAMPLE_RATE);
+        let synthesizers = (0..synth_count)
+            .map(|_| Self::make_synthesizer(sound_font.clone(), DEFAULT_SAMPLE_RATE))
+            .collect();
         let midi_sequencer = MidiSequencer::new(events);
 
-        let synthesizer = Arc::new(Mutex::new(synthesizer));
+        let synthesizers = Arc::new(Mutex::new(synthesizers));
         let sequencer = Arc::new(Mutex::new(midi_sequencer));
         Self {
             is_playing: false,
@@ -72,7 +119,8 @@ impl AudioPlayer {
             stream: None,
             sequencer,
             player_params,
-            synthesizer,
+            synthesizers,
+            track_isolated,
             sound_font,
             beat_sender,
         }
@@ -87,6 +135,11 @@ impl AudioPlayer {
 
     pub const fn is_playing(&self) -> bool {
         self.is_playing
+    }
+
+    /// The ordered trace currently held by the production sequencer.
+    pub fn event_trace(&self) -> Vec<MidiEvent> {
+        self.sequencer.lock().unwrap().events().to_vec()
     }
 
     pub fn solo_track_id(&self) -> Option<usize> {
@@ -126,8 +179,10 @@ impl AudioPlayer {
         drop(sequencer_guard);
 
         // stop all sound in synthesizer
-        let mut synthesizer_guard = self.synthesizer.lock().unwrap();
-        synthesizer_guard.note_off_all(false);
+        let mut synthesizer_guard = self.synthesizers.lock().unwrap();
+        for synthesizer in synthesizer_guard.iter_mut() {
+            synthesizer.note_off_all(false);
+        }
         drop(synthesizer_guard);
 
         // Drop stream
@@ -157,7 +212,8 @@ impl AudioPlayer {
             let stream = new_output_stream(
                 self.sequencer.clone(),
                 self.player_params.clone(),
-                self.synthesizer.clone(),
+                self.synthesizers.clone(),
+                self.track_isolated,
                 self.sound_font.clone(),
                 self.beat_sender.clone(),
             );
@@ -187,8 +243,10 @@ impl AudioPlayer {
         drop(sequencer_guard);
 
         // stop current sound
-        let mut synthesizer_guard = self.synthesizer.lock().unwrap();
-        synthesizer_guard.note_off_all(false);
+        let mut synthesizer_guard = self.synthesizers.lock().unwrap();
+        for synthesizer in synthesizer_guard.iter_mut() {
+            synthesizer.note_off_all(false);
+        }
         drop(synthesizer_guard);
 
         // set tempo for focuses measure
@@ -218,8 +276,10 @@ impl AudioPlayer {
         drop(sequencer_guard);
 
         // Stop all currently playing notes
-        let mut synthesizer_guard = self.synthesizer.lock().unwrap();
-        synthesizer_guard.note_off_all(false);
+        let mut synthesizer_guard = self.synthesizers.lock().unwrap();
+        for synthesizer in synthesizer_guard.iter_mut() {
+            synthesizer.note_off_all(false);
+        }
         drop(synthesizer_guard);
 
         // Resume stream if was playing
@@ -275,7 +335,8 @@ enum AudioStreamError {
 fn new_output_stream(
     sequencer: Arc<Mutex<MidiSequencer>>,
     player_params: Arc<Mutex<MidiPlayerParams>>,
-    synthesizer: Arc<Mutex<Synthesizer>>,
+    synthesizers: Arc<Mutex<Vec<Synthesizer>>>,
+    track_isolated: bool,
     sound_font: Arc<SoundFont>,
     beat_notifier: Arc<Sender<u32>>,
 ) -> Result<cpal::Stream, AudioStreamError> {
@@ -303,11 +364,12 @@ fn new_output_stream(
         stream_config.sample_rate.0
     );
 
-    let mut synthesizer_guard = synthesizer.lock().unwrap();
+    let mut synthesizer_guard = synthesizers.lock().unwrap();
     if sample_rate != DEFAULT_SAMPLE_RATE {
         // audio output is not using the default sample rate - recreate synthesizer with proper sample rate
-        let new_synthesizer = AudioPlayer::make_synthesizer(sound_font, sample_rate);
-        *synthesizer_guard = new_synthesizer;
+        for synth in synthesizer_guard.iter_mut() {
+            *synth = AudioPlayer::make_synthesizer(sound_font.clone(), sample_rate);
+        }
     }
 
     // Apply events at tick=FIRST_TICK to set up synthesizer state
@@ -321,7 +383,14 @@ fn new_output_stream(
         .filter(|event| event.is_midi_message())
         .for_each(|event| {
             if let MidiEventType::MidiMessage(channel, command, data1, data2) = event.event {
-                synthesizer_guard.process_midi_message(channel, command, data1, data2);
+                let target = if track_isolated {
+                    event.track.unwrap_or(0) as usize
+                } else {
+                    0
+                };
+                if let Some(synth) = synthesizer_guard.get_mut(target) {
+                    synth.process_midi_message(channel, command, data1, data2);
+                }
             }
         });
 
@@ -335,6 +404,8 @@ fn new_output_stream(
     // reuse buffer for left and right channels across all calls
     let mut left: Vec<f32> = vec![0_f32; channel_sample_count as usize];
     let mut right: Vec<f32> = vec![0_f32; channel_sample_count as usize];
+    let mut track_left: Vec<f32> = vec![0_f32; channel_sample_count as usize];
+    let mut track_right: Vec<f32> = vec![0_f32; channel_sample_count as usize];
 
     let err_fn = |err| log::error!("an error occurred on stream: {err}");
 
@@ -344,11 +415,11 @@ fn new_output_stream(
             let mut player_params_guard = player_params.lock().unwrap();
             let mut sequencer_guard = sequencer.lock().unwrap();
             sequencer_guard.advance(player_params_guard.adjusted_tempo());
-            let mut synthesizer_guard = synthesizer.lock().unwrap();
+            let mut synthesizer_guard = synthesizers.lock().unwrap();
+            let tick = sequencer_guard.get_tick();
+            let last_tick = sequencer_guard.get_last_tick();
             // process midi events for current tick
             if let Some(events) = sequencer_guard.get_next_events() {
-                let tick = sequencer_guard.get_tick();
-                let last_tick = sequencer_guard.get_last_tick();
                 if !events.is_empty() {
                     log::debug!(
                         "---> Increase {} ticks [{} -> {}] ({} events)",
@@ -367,6 +438,11 @@ fn new_output_stream(
                         .expect("Failed to send beat notification");
                 }
                 for midi_event in events {
+                    let target = if track_isolated {
+                        midi_event.track.unwrap_or(0) as usize
+                    } else {
+                        0
+                    };
                     match midi_event.event {
                         MidiEventType::NoteOn(channel, key, velocity) => {
                             // Check if track is audible (handles both solo and mute)
@@ -382,7 +458,9 @@ fn new_output_stream(
                                 key,
                                 velocity
                             );
-                            synthesizer_guard.note_on(channel, key, i32::from(velocity));
+                            if let Some(synth) = synthesizer_guard.get_mut(target) {
+                                synth.note_on(channel, key, i32::from(velocity));
+                            }
                         }
                         MidiEventType::NoteOff(channel, key) => {
                             log::debug!(
@@ -391,7 +469,9 @@ fn new_output_stream(
                                 channel,
                                 key
                             );
-                            synthesizer_guard.note_off(channel, key);
+                            if let Some(synth) = synthesizer_guard.get_mut(target) {
+                                synth.note_off(channel, key);
+                            }
                         }
                         MidiEventType::TempoChange(tempo) => {
                             log::info!("Tempo changed to {tempo}");
@@ -406,7 +486,9 @@ fn new_output_stream(
                                 data1,
                                 data2
                             );
-                            synthesizer_guard.process_midi_message(channel, command, data1, data2);
+                            if let Some(synth) = synthesizer_guard.get_mut(target) {
+                                synth.process_midi_message(channel, command, data1, data2);
+                            }
                         }
                     }
                 }
@@ -424,10 +506,18 @@ fn new_output_stream(
             }
 
             // Render the waveform.
-            synthesizer_guard.render(
-                &mut left[..output_channel_len],
-                &mut right[..output_channel_len],
-            );
+            left[..output_channel_len].fill(0.0);
+            right[..output_channel_len].fill(0.0);
+            for synth in synthesizer_guard.iter_mut() {
+                synth.render(
+                    &mut track_left[..output_channel_len],
+                    &mut track_right[..output_channel_len],
+                );
+                for i in 0..output_channel_len {
+                    left[i] += track_left[i];
+                    right[i] += track_right[i];
+                }
+            }
 
             // Drop locks
             drop(sequencer_guard);

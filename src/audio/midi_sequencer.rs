@@ -8,6 +8,7 @@ pub struct MidiSequencer {
     last_tick: u32,                // last Midi tick
     last_time: Instant,            // last time in milliseconds
     sorted_events: Vec<MidiEvent>, // sorted Midi events
+    next_event: usize,             // first event not yet delivered
 }
 
 impl MidiSequencer {
@@ -22,6 +23,7 @@ impl MidiSequencer {
             last_tick: 0,
             last_time: Instant::now(),
             sorted_events,
+            next_event: 0,
         }
     }
 
@@ -34,6 +36,9 @@ impl MidiSequencer {
     pub fn set_tick(&mut self, tick: u32) {
         self.last_tick = tick;
         self.current_tick = tick;
+        self.next_event = self
+            .sorted_events
+            .partition_point(|event| event.tick < tick);
     }
 
     pub fn reset_last_time(&mut self) {
@@ -44,6 +49,7 @@ impl MidiSequencer {
     pub fn reset_ticks(&mut self) {
         self.current_tick = 0;
         self.last_tick = 0;
+        self.next_event = 0;
     }
 
     pub const fn get_tick(&self) -> u32 {
@@ -54,44 +60,16 @@ impl MidiSequencer {
         self.last_tick
     }
 
-    pub fn get_next_events(&self) -> Option<&[MidiEvent]> {
-        // do not return events if tick did not change
-        if self.last_tick == self.current_tick {
-            return Some(&[]);
+    pub fn get_next_events(&mut self) -> Option<&[MidiEvent]> {
+        if self.next_event == self.sorted_events.len() {
+            return None;
         }
-
-        assert!(self.last_tick <= self.current_tick);
-
-        // get all events between last tick and next tick using binary search
-        // TODO could be improved by saving `end_index` to the next `start_index`
-        let start_index = match self
-            .sorted_events
-            .binary_search_by_key(&self.last_tick, |event| event.tick)
-        {
-            Ok(position) => position + 1,
-            Err(position) => {
-                // exit if end reached
-                if position == self.sorted_events.len() {
-                    return None;
-                }
-                position
-            }
-        };
-
-        let end_index = match self.sorted_events[start_index..]
-            .binary_search_by_key(&self.current_tick, |event| event.tick)
-        {
-            Ok(next_position) => start_index + next_position,
-            Err(next_position) => {
-                if next_position == 0 {
-                    // no matching elements
-                    return Some(&[]);
-                }
-                // return slice until the last event
-                start_index + next_position - 1
-            }
-        };
-        Some(&self.sorted_events[start_index..=end_index])
+        let end = self.next_event
+            + self.sorted_events[self.next_event..]
+                .partition_point(|event| event.tick <= self.current_tick);
+        let start = self.next_event;
+        self.next_event = end;
+        Some(&self.sorted_events[start..end])
     }
 
     pub fn advance(&mut self, tempo: u32) {
@@ -147,6 +125,28 @@ mod tests {
         let elapsed = Duration::from_millis(100);
         let result = tick_increase(tempo, elapsed.as_secs_f32());
         assert_eq!(result, 192);
+    }
+
+    #[test]
+    fn delivers_tick_zero_simultaneous_events_and_exact_seek_once() {
+        let events = vec![
+            MidiEvent::new_note_on(0, 0, 45, 95, 0),
+            MidiEvent::new_note_on(0, 0, 45, 95, 1),
+            MidiEvent::new_note_off(160, 0, 45, 0),
+            MidiEvent::new_note_on(160, 0, 46, 95, 0),
+            MidiEvent::new_note_off(320, 0, 46, 0),
+        ];
+        let mut sequencer = MidiSequencer::new(events.clone());
+        assert_eq!(sequencer.get_next_events().unwrap(), &events[..2]);
+        assert!(sequencer.get_next_events().unwrap().is_empty());
+        sequencer.advance_tick(160);
+        assert_eq!(sequencer.get_next_events().unwrap(), &events[2..4]);
+        assert!(sequencer.get_next_events().unwrap().is_empty());
+        sequencer.set_tick(160);
+        assert_eq!(sequencer.get_next_events().unwrap(), &events[2..4]);
+        sequencer.advance_tick(160);
+        assert_eq!(sequencer.get_next_events().unwrap(), &events[4..]);
+        assert!(sequencer.get_next_events().is_none());
     }
     #[test]
     fn test_sequence_demo_song() {

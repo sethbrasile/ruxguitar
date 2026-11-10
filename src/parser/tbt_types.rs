@@ -266,6 +266,8 @@ pub struct TbtNote {
     pub is_stop: bool,
     /// Effect applied to this note
     pub effect: Option<TbtStringEffect>,
+    /// Original per-string effect slot, including unknown codes.
+    pub raw_effect: u8,
 }
 
 /// Note value constants
@@ -339,6 +341,8 @@ pub struct TbtEffectChange {
     /// Track-local cell position.
     pub space: u32,
     pub raw_id: u16,
+    /// Whether the ID came from an inline ASCII slot (rather than a numeric chunk).
+    pub inline: bool,
     /// Effect type
     pub effect_type: TbtEffectChangeType,
     /// Effect value (interpretation depends on effect_type)
