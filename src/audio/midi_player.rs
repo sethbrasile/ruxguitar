@@ -9,6 +9,7 @@ use cpal::DefaultStreamConfigError;
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 use std::fs::File;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch::Sender;
 
@@ -18,10 +19,11 @@ const TIMIDITY_SOUND_FONT: &[u8] = include_bytes!("../../resources/TimGM6mb.sf2"
 pub struct AudioPlayer {
     is_playing: bool,
     song: Arc<Song>,                             // Song to play (shared with app)
-    stream: Option<cpal::Stream>,                // Audio output stream (not Send/Sync)
+    stream: Option<OutputStream>,                // Audio output stream (not Send/Sync)
     sequencer: Arc<Mutex<MidiSequencer>>,        // Need a handle to reset sequencer
     player_params: Arc<Mutex<MidiPlayerParams>>, // Use to communicate play changes to sequencer
     synthesizers: Arc<Mutex<Vec<Synthesizer>>>,  // One synth per track for TBT
+    keep_ready: bool,
     tbt_track_count: Option<usize>,
     sound_font: Arc<SoundFont>,    // Sound font for synthesizer
     beat_sender: Arc<Sender<u32>>, // Notify beat changes
@@ -106,6 +108,7 @@ impl AudioPlayer {
             is_playing: false,
             song,
             stream: None,
+            keep_ready: false,
             sequencer,
             player_params,
             synthesizers,
@@ -122,8 +125,12 @@ impl AudioPlayer {
         Synthesizer::new(&sound_font, &synthesizer_settings).unwrap()
     }
 
-    pub const fn is_playing(&self) -> bool {
+    pub fn is_playing(&self) -> bool {
         self.is_playing
+            && self
+                .stream
+                .as_ref()
+                .is_some_and(|s| !s.failed.load(Ordering::Relaxed))
     }
 
     /// The ordered trace currently held by the production sequencer.
@@ -151,51 +158,97 @@ impl AudioPlayer {
         params_guard.set_tempo_percentage(new_tempo_percentage);
     }
 
+    /// Start feeding silence as soon as the document is ready. The device
+    /// stays open until this player is dropped, including during Stop/Pause.
+    pub fn prepare_output(&mut self) -> Result<(), String> {
+        self.keep_ready = true;
+        self.open_output().map_err(|err| err.to_string())
+    }
+
+    fn open_output(&mut self) -> Result<(), AudioStreamError> {
+        if self
+            .stream
+            .as_ref()
+            .is_some_and(|s| s.failed.load(Ordering::Relaxed))
+        {
+            self.stream.take();
+            self.is_playing = false;
+            self.synthesizers.lock().unwrap().clear();
+        }
+        if self.stream.is_none() {
+            self.stream = Some(new_output_stream(self)?);
+        }
+        Ok(())
+    }
+
     pub fn stop(&mut self) {
-        // Join the stream callback before resetting state for the next Play.
-        // Releasing notes alone leaves voices and a partially rendered synth
-        // block that can bleed into the first attack on restart.
-        drop(self.stream.take());
+        if let Some(output) = &self.stream {
+            *output.playing.lock().unwrap() = false;
+        }
+        if !self.keep_ready {
+            self.stream.take();
+        }
         self.is_playing = false;
         self.sequencer.lock().unwrap().reset_ticks();
         self.synthesizers.lock().unwrap().clear();
     }
 
     pub fn toggle_play(&mut self) {
-        log::info!("Toggle audio stream");
-        if let Some(ref stream) = self.stream {
-            if self.is_playing {
-                self.is_playing = false;
-                if let Err(e) = stream.pause() {
-                    log::error!("Failed to pause stream: {e}");
-                }
-            } else {
-                self.is_playing = true;
-                if let Err(e) = stream.play() {
-                    log::error!("Failed to play stream: {e}");
+        if let Err(err) = self.open_output() {
+            log::error!("Failed to open audio stream: {err}");
+            return;
+        }
+        let output = self.stream.as_ref().unwrap();
+        if self.is_playing {
+            *output.playing.lock().unwrap() = false;
+            self.is_playing = false;
+            if !self.keep_ready {
+                if let Err(err) = output.stream.pause() {
+                    log::error!("Failed to pause audio stream: {err}");
                 }
             }
-        } else {
-            self.is_playing = true;
+            return;
+        }
 
-            // Initialize audio output stream
-            let stream = new_output_stream(
-                self.sequencer.clone(),
-                self.player_params.clone(),
-                self.synthesizers.clone(),
-                self.tbt_track_count,
-                self.sound_font.clone(),
-                self.beat_sender.clone(),
-            );
+        self.initialize_voices_if_needed(output.sample_rate);
+        if !self.keep_ready {
+            if let Err(err) = output.stream.play() {
+                log::error!("Failed to start audio stream: {err}");
+                return;
+            }
+        }
+        *output.playing.lock().unwrap() = true;
+        self.is_playing = true;
+    }
 
-            match stream {
-                Ok(stream) => {
-                    self.stream = Some(stream);
-                }
-                Err(err) => {
-                    log::error!("Failed to create audio stream: {err}");
-                    self.is_playing = false;
-                    self.stream = None;
+    fn initialize_voices_if_needed(&self, sample_rate: u32) {
+        let mut synthesizer_guard = self.synthesizers.lock().unwrap();
+        if !synthesizer_guard.is_empty() {
+            return;
+        }
+        let track_isolated = self.tbt_track_count.is_some();
+        *synthesizer_guard = (0..self.tbt_track_count.unwrap_or(1))
+            .map(|_| AudioPlayer::make_synthesizer(self.sound_font.clone(), sample_rate))
+            .collect();
+
+        // A new playback run has fresh voices. Restore controller and instrument changes
+        // before a start at the cursor. The renderer handles the cursor tick itself.
+        {
+            let seq = self.sequencer.lock().unwrap();
+            for event in seq
+                .events()
+                .iter()
+                .take_while(|event| event.tick < seq.get_tick())
+            {
+                if let MidiEventType::MidiMessage(channel, command, data1, data2) = event.event {
+                    let target = if track_isolated {
+                        event.track.unwrap_or(0) as usize
+                    } else {
+                        0
+                    };
+                    if let Some(synth) = synthesizer_guard.get_mut(target) {
+                        synth.process_midi_message(channel, command, data1, data2);
+                    }
                 }
             }
         }
@@ -226,19 +279,10 @@ impl AudioPlayer {
 
     /// Seek to a specific tick position.
     ///
-    /// Pauses if playing, seeks to the tick, then resumes if was playing.
+    /// Move the cursor and release held notes between audio callbacks.
     pub fn seek_to_tick(&mut self, tick: u32) {
-        let was_playing = self.is_playing;
-
-        // Pause stream if playing
-        if was_playing {
-            if let Some(stream) = &self.stream {
-                if let Err(e) = stream.pause() {
-                    log::error!("Failed to pause stream during seek: {e}");
-                }
-            }
-        }
-
+        // Exclude the callback while moving both the cursor and voices.
+        let _transport = self.stream.as_ref().map(|s| s.playing.lock().unwrap());
         // Move sequencer to the requested tick
         let mut sequencer_guard = self.sequencer.lock().unwrap();
         sequencer_guard.set_tick(tick);
@@ -250,15 +294,6 @@ impl AudioPlayer {
             synthesizer.note_off_all(false);
         }
         drop(synthesizer_guard);
-
-        // Resume stream if was playing
-        if was_playing {
-            if let Some(stream) = &self.stream {
-                if let Err(e) = stream.play() {
-                    log::error!("Failed to resume stream after seek: {e}");
-                }
-            }
-        }
     }
 
     /// Get the current playback tick position.
@@ -300,15 +335,15 @@ enum AudioStreamError {
     StreamPlayError(String),
 }
 
-/// Create a new output stream for audio playback.
-fn new_output_stream(
-    sequencer: Arc<Mutex<MidiSequencer>>,
-    player_params: Arc<Mutex<MidiPlayerParams>>,
-    synthesizers: Arc<Mutex<Vec<Synthesizer>>>,
-    tbt_track_count: Option<usize>,
-    sound_font: Arc<SoundFont>,
-    beat_notifier: Arc<Sender<u32>>,
-) -> Result<cpal::Stream, AudioStreamError> {
+struct OutputStream {
+    stream: cpal::Stream,
+    sample_rate: u32,
+    playing: Arc<Mutex<bool>>,
+    failed: Arc<AtomicBool>,
+}
+
+/// Start the physical stream independently of the score transport.
+fn new_output_stream(player: &AudioPlayer) -> Result<OutputStream, AudioStreamError> {
     let host = cpal::default_host();
     let Some(device) = host.default_output_device() else {
         return Err(AudioStreamError::CpalDeviceNotFount);
@@ -318,11 +353,12 @@ fn new_output_stream(
         .default_output_config()
         .map_err(AudioStreamError::CpalOutputConfigNotFound)?;
 
-    assert!(
-        config.sample_format().is_float(),
-        "{}",
-        format!("Unsupported sample format {}", config.sample_format())
-    );
+    if config.sample_format() != cpal::SampleFormat::F32 {
+        return Err(AudioStreamError::StreamBuildError(format!(
+            "Unsupported sample format {}",
+            config.sample_format()
+        )));
+    }
     let stream_config: cpal::StreamConfig = config.into();
     let sample_rate = stream_config.sample_rate.0;
 
@@ -333,45 +369,34 @@ fn new_output_stream(
         stream_config.sample_rate.0
     );
 
-    let mut synthesizer_guard = synthesizers.lock().unwrap();
-    let track_isolated = tbt_track_count.is_some();
-    *synthesizer_guard = (0..tbt_track_count.unwrap_or(1))
-        .map(|_| AudioPlayer::make_synthesizer(sound_font.clone(), sample_rate))
-        .collect();
-
-    // A new stream has fresh voices. Restore controller and instrument changes
-    // before a start at the cursor. The renderer handles the cursor tick itself.
-    {
-        let seq = sequencer.lock().unwrap();
-        for event in seq
-            .events()
-            .iter()
-            .take_while(|event| event.tick < seq.get_tick())
-        {
-            if let MidiEventType::MidiMessage(channel, command, data1, data2) = event.event {
-                let target = if track_isolated {
-                    event.track.unwrap_or(0) as usize
-                } else {
-                    0
-                };
-                if let Some(synth) = synthesizer_guard.get_mut(target) {
-                    synth.process_midi_message(channel, command, data1, data2);
-                }
-            }
-        }
-    }
-    drop(synthesizer_guard);
-
-    let mut render = output_renderer(
-        sequencer,
-        player_params,
-        synthesizers,
-        track_isolated,
-        beat_notifier,
+    let channels = usize::from(stream_config.channels);
+    let render = output_renderer(
+        player.sequencer.clone(),
+        player.player_params.clone(),
+        player.synthesizers.clone(),
+        player.tbt_track_count.is_some(),
+        player.beat_sender.clone(),
         sample_rate,
-        usize::from(stream_config.channels),
+        channels,
     );
-    let err_fn = |err| log::error!("an error occurred on stream: {err}");
+    let playing = Arc::new(Mutex::new(false));
+    // An immediate Play on a newly opened score may arrive during HDMI wake.
+    // Allow half a second of silent output from open, including time already
+    // spent with the score stopped. Warm plays have no additional lead-in.
+    let warmup_frames = if player.keep_ready {
+        sample_rate as usize / 2
+    } else {
+        0
+    };
+    let mut render = transport_output(render, playing.clone(), warmup_frames * channels);
+    let failed = Arc::new(AtomicBool::new(false));
+    let failed_callback = failed.clone();
+    let err_fn = move |err| {
+        if matches!(err, cpal::StreamError::DeviceNotAvailable) {
+            failed_callback.store(true, Ordering::Relaxed);
+        }
+        log::error!("an error occurred on stream: {err}");
+    };
     let stream = device.build_output_stream(
         &stream_config,
         move |output: &mut [f32], _: &cpal::OutputCallbackInfo| render(output),
@@ -379,10 +404,38 @@ fn new_output_stream(
         None, // blocking stream
     );
     let stream = stream.map_err(|e| AudioStreamError::StreamBuildError(e.to_string()))?;
-    stream
-        .play()
-        .map_err(|e| AudioStreamError::StreamPlayError(e.to_string()))?;
-    Ok(stream)
+    if player.keep_ready {
+        stream
+            .play()
+            .map_err(|e| AudioStreamError::StreamPlayError(e.to_string()))?;
+    }
+    Ok(OutputStream {
+        stream,
+        sample_rate,
+        playing,
+        failed,
+    })
+}
+
+fn transport_output(
+    mut render: impl FnMut(&mut [f32]),
+    playing: Arc<Mutex<bool>>,
+    mut warmup_samples: usize,
+) -> impl FnMut(&mut [f32]) {
+    move |output| {
+        let playing = playing.lock().unwrap();
+        let silent_count = warmup_samples.min(output.len());
+        let (warmup, ready) = output.split_at_mut(silent_count);
+        warmup.fill(0.0);
+        warmup_samples -= silent_count;
+        if *playing {
+            if !ready.is_empty() {
+                render(ready);
+            }
+        } else {
+            ready.fill(0.0);
+        }
+    }
 }
 
 fn output_renderer(
@@ -476,6 +529,36 @@ fn apply_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opening_and_idling_the_output_preserves_the_first_score_sample() {
+        let playing = Arc::new(Mutex::new(false));
+        let mut next = 1;
+        let mut output = transport_output(
+            |buf| {
+                for sample in buf {
+                    *sample = next as f32;
+                    next += 1;
+                }
+            },
+            playing.clone(),
+            6,
+        );
+        let mut buf = [f32::NAN; 4];
+        output(&mut buf);
+        assert_eq!(buf, [0.; 4]);
+        *playing.lock().unwrap() = true;
+        output(&mut buf);
+        assert_eq!(buf, [0., 0., 1., 2.]);
+        *playing.lock().unwrap() = false;
+        for _ in 0..10 {
+            output(&mut buf);
+            assert_eq!(buf, [0.; 4]);
+        }
+        *playing.lock().unwrap() = true;
+        output(&mut buf);
+        assert_eq!(buf, [3., 4., 5., 6.]);
+    }
 
     #[test]
     fn renders_four_triplet_attacks_at_their_frame_offsets() {
